@@ -13,7 +13,7 @@ const COURTS = {
 const WEEKDAY_TIMES = ['19:00'];
 const WEEKEND_TIMES = ['09:00', '11:00', '13:00', '15:00', '17:00', '19:00'];
 
-// 2026~2027 주요 공휴일 목록 (평일이라도 주말처럼 전 시간대 감시하고 싶을 때 활용)
+// 2026~2027 주요 공휴일 목록
 const KR_HOLIDAYS = new Set([
   '20261225', // 크리스마스
   '20270101', // 신정
@@ -21,43 +21,88 @@ const KR_HOLIDAYS = new Set([
   '20270301'  // 삼일절
 ]);
 
-// 한국 시간(KST) 기준 조회할 날짜 리스트 생성
-function getTargetDates(days = 25) {
-  const dates = [];
+// 특정 연/월의 '3번째 화요일' 날짜(일)를 구하는 함수
+function getThirdTuesdayDate(year, monthIndex) {
+  // 해당 월 1일의 요일 (0: 일, 1: 월, 2: 화, ..., 6: 토)
+  const firstDayOfWeek = new Date(Date.UTC(year, monthIndex, 1)).getUTCDay();
+  // 첫 번째 화요일(2)까지의 날짜 차이 계산
+  const offsetToFirstTuesday = (2 - firstDayOfWeek + 7) % 7;
+  const firstTuesday = 1 + offsetToFirstTuesday;
+  // 3번째 화요일 = 첫 번째 화요일 + 14일
+  return firstTuesday + 14;
+}
+
+// 한국 시간(KST) 기준 조회할 날짜 리스트 자동 생성
+function getSmartTargetDates(overrideDays = null) {
   const now = new Date();
   const kstNow = new Date(now.getTime() + 9 * 60 * 60 * 1000);
 
+  const year = kstNow.getUTCFullYear();
+  const month = kstNow.getUTCMonth(); // 0(1월) ~ 11(12월)
+  const date = kstNow.getUTCDate();
+  const hours = kstNow.getUTCHours();
+  const minutes = kstNow.getUTCMinutes();
+
   const currentYmd =
-    `${kstNow.getUTCFullYear()}` +
-    `${String(kstNow.getUTCMonth() + 1).padStart(2, '0')}` +
-    `${String(kstNow.getUTCDate()).padStart(2, '0')}`;
+    `${year}` +
+    `${String(month + 1).padStart(2, '0')}` +
+    `${String(date).padStart(2, '0')}`;
   const currentHm =
-    `${String(kstNow.getUTCHours()).padStart(2, '0')}:` +
-    `${String(kstNow.getUTCMinutes()).padStart(2, '0')}`;
+    `${String(hours).padStart(2, '0')}:` +
+    `${String(minutes).padStart(2, '0')}`;
 
+  let endDateUtc;
+
+  // 1) 만약 URL에 ?days=N 파라미터를 수동으로 넣었다면 해당 일수만큼 조회
+  if (overrideDays) {
+    endDateUtc = new Date(Date.UTC(year, month, date + overrideDays - 1));
+  } else {
+    // 2) 자동 계산: 이번 달 3번째 화요일 오전 9시 경과 여부 확인
+    const thirdTuesday = getThirdTuesdayDate(year, month);
+    const isNextMonthOpened =
+      date > thirdTuesday || (date === thirdTuesday && hours >= 9);
+
+    if (isNextMonthOpened) {
+      // 3번째 화요일 09:00 이후 -> 다음 달 말일까지 스캔 (month + 2의 0번째 날 = 다음 달 말일)
+      endDateUtc = new Date(Date.UTC(year, month + 2, 0));
+    } else {
+      // 3번째 화요일 09:00 이전 -> 이번 달 말일까지만 스캔 (month + 1의 0번째 날 = 이번 달 말일)
+      endDateUtc = new Date(Date.UTC(year, month + 1, 0));
+    }
+  }
+
+  const dates = [];
   const dayNames = ['일', '월', '화', '수', '목', '금', '토'];
+  const startUtc = new Date(Date.UTC(year, month, date));
 
-  for (let i = 0; i < days; i++) {
-    const d = new Date(kstNow);
-    d.setUTCDate(kstNow.getUTCDate() + i);
-
+  for (
+    let d = new Date(startUtc);
+    d <= endDateUtc;
+    d.setUTCDate(d.getUTCDate() + 1)
+  ) {
     const yyyy = d.getUTCFullYear();
     const mm = String(d.getUTCMonth() + 1).padStart(2, '0');
     const dd = String(d.getUTCDate()).padStart(2, '0');
     const dateStr = `${yyyy}${mm}${dd}`;
-    const dayOfWeek = d.getUTCDay(); // 0: 일, 6: 토
+    const dayOfWeek = d.getUTCDay();
 
-    const isWeekendOrHoliday = dayOfWeek === 0 || dayOfWeek === 6 || KR_HOLIDAYS.has(dateStr);
+    const isWeekendOrHoliday =
+      dayOfWeek === 0 || dayOfWeek === 6 || KR_HOLIDAYS.has(dateStr);
 
     dates.push({
       dateStr,
       dateFormatted: `${yyyy}-${mm}-${dd}(${dayNames[dayOfWeek]})`,
-      dayType: isWeekendOrHoliday ? (KR_HOLIDAYS.has(dateStr) ? '공휴일' : '주말') : '평일',
+      dayType: isWeekendOrHoliday
+        ? KR_HOLIDAYS.has(dateStr)
+          ? '공휴일'
+          : '주말'
+        : '평일',
       targetTimes: isWeekendOrHoliday ? WEEKEND_TIMES : WEEKDAY_TIMES,
       isToday: dateStr === currentYmd,
       currentHm
     });
   }
+
   return dates;
 }
 
@@ -119,15 +164,9 @@ async function fetchCourtState(placeCode, courtName, dateInfo) {
       const useYn = String(item.use_yn || '').trim().toUpperCase();
       const detail = String(item.detail || '').trim();
 
-      // 1) 우리가 원하는 타겟 시간대인지 확인 (평일: 19:00, 주말: 전 시간대)
       if (!targetTimes.includes(startTime)) continue;
-
-      // 2) 오늘 날짜인 경우 이미 시작 시간이 지난 타임은 제외
       if (isToday && startTime <= currentHm) continue;
 
-      // 3) 빈자리 판별 핵심 로직:
-      // 예약이 차 있으면 detail에 "홍길동(홍길동)"처럼 이름이 들어가고 use_yn이 "Y"가 됨.
-      // 빈자리는 detail이 비어있거나("") use_yn이 "N"으로 내려옴.
       const isAvailable = (detail === '' || useYn === 'N');
 
       if (isAvailable) {
@@ -147,17 +186,15 @@ async function fetchCourtState(placeCode, courtName, dateInfo) {
 }
 
 export default async function handler(req, res) {
-  // 1. 보안용 Secret 검증
   const secret = req.query.secret || req.headers['x-cron-secret'];
   if (process.env.CRON_SECRET && secret !== process.env.CRON_SECRET) {
     return res.status(401).json({ error: 'Unauthorized' });
   }
 
-  // 기본 25일 치 조회 (쿼리 파라미터 ?days=14 등으로 조절 가능)
-  const daysToScan = parseInt(req.query.days || '25', 10);
-  const targetDates = getTargetDates(daysToScan);
+  // ?days 파라미터가 없으면 매월 3번째 화요일 09시 기준 자동 계산
+  const overrideDays = req.query.days ? parseInt(req.query.days, 10) : null;
+  const targetDates = getSmartTargetDates(overrideDays);
 
-  // 2. 전체 (날짜 x 4개 코트) 작업 목록 생성
   const tasks = [];
   for (const dateInfo of targetDates) {
     for (const [placeCode, courtName] of Object.entries(COURTS)) {
@@ -165,8 +202,7 @@ export default async function handler(req, res) {
     }
   }
 
-  // 강서구 서버 부하 방지를 위해 20개씩 배치(Batch) 병렬 실행 (총 1~2초 소요)
-  const BATCH_SIZE = 20;
+  const BATCH_SIZE = 25;
   const results = [];
   for (let i = 0; i < tasks.length; i += BATCH_SIZE) {
     const chunk = tasks.slice(i, i + BATCH_SIZE).map((fn) => fn());
@@ -195,28 +231,29 @@ export default async function handler(req, res) {
         };
         allCurrentlyOpen.push(slotInfo);
 
-        // 이전에 알림을 보낸 적이 없는 새로운 빈자리만 발송 목록에 추가
         if (!notifiedCache.has(slotKey)) {
           notifiedCache.add(slotKey);
           newlyFound.push(slotInfo);
         }
       } else {
-        // 누군가 예약해서 마감되면 캐시에서 제거 (나중에 다시 취소표가 나오면 재알림)
         notifiedCache.delete(slotKey);
       }
     }
   }
 
-  // 3. 테스트 발송 옵션 (?test=1 붙여서 호출 시 강제로 작동 확인 메시지 전송)
+  const scanRangeText =
+    targetDates.length > 0
+      ? `${targetDates[0].dateFormatted} ~ ${targetDates[targetDates.length - 1].dateFormatted} (${targetDates.length}일간)`
+      : '없음';
+
   if (req.query.test === '1') {
     await sendTelegram(
       `✅ <b>[강서구립테니스장 알림 봇 정상 작동 중]</b>\n` +
-      `• 스캔 기간: 향후 ${daysToScan}일 (${tasks.length}개 코트·날짜 조합)\n` +
+      `• 자동 스캔 범위: ${scanRangeText}\n` +
       `• 현재 열려있는 타겟 빈자리: ${allCurrentlyOpen.length}건`
     );
   }
 
-  // 4. 새로운 빈자리 발견 시 텔레그램 알림 발송
   if (newlyFound.length > 0) {
     const lines = newlyFound.map(
       (s) =>
@@ -234,7 +271,8 @@ export default async function handler(req, res) {
 
   return res.status(200).json({
     ok: true,
-    scannedDays: daysToScan,
+    scanRange: scanRangeText,
+    scannedDays: targetDates.length,
     totalApiCalls: tasks.length,
     currentlyOpenCount: allCurrentlyOpen.length,
     newAlertsSent: newlyFound.length,
