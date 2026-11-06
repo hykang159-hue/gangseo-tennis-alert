@@ -1,9 +1,7 @@
-import * as cheerio from 'cheerio';
-
-// 컨테이너 재사용(Warm start) 시 중복 발송을 막기 위한 인메모리 캐시
+// 컨테이너 재사용(Warm start) 시 중복 알림을 막기 위한 인메모리 캐시
 const notifiedCache = new Set();
 
-// 코트 목록 (place 파라미터 : 코트명)
+// 감시할 코트 목록
 const COURTS = {
   3: '3코트',
   4: '4코트',
@@ -11,16 +9,33 @@ const COURTS = {
   6: '6코트(연습가능)'
 };
 
-// 평일 및 주말 타겟 시간대 (2시간 단위 시작 시각 기준)
+// 평일 및 주말 타겟 시작 시간 (start_time 기준)
 const WEEKDAY_TIMES = ['19:00'];
 const WEEKEND_TIMES = ['09:00', '11:00', '13:00', '15:00', '17:00', '19:00'];
 
-// 한국 시간(KST) 기준 날짜 리스트 생성 (오늘부터 N일간)
-function getTargetDates(days = 14) {
+// 2026~2027 주요 공휴일 목록 (평일이라도 주말처럼 전 시간대 감시하고 싶을 때 활용)
+const KR_HOLIDAYS = new Set([
+  '20261225', // 크리스마스
+  '20270101', // 신정
+  '20270206', '20270207', '20270208', '20270209', // 설날 연휴
+  '20270301'  // 삼일절
+]);
+
+// 한국 시간(KST) 기준 조회할 날짜 리스트 생성
+function getTargetDates(days = 25) {
   const dates = [];
   const now = new Date();
-  // UTC -> KST 변환
   const kstNow = new Date(now.getTime() + 9 * 60 * 60 * 1000);
+
+  const currentYmd =
+    `${kstNow.getUTCFullYear()}` +
+    `${String(kstNow.getUTCMonth() + 1).padStart(2, '0')}` +
+    `${String(kstNow.getUTCDate()).padStart(2, '0')}`;
+  const currentHm =
+    `${String(kstNow.getUTCHours()).padStart(2, '0')}:` +
+    `${String(kstNow.getUTCMinutes()).padStart(2, '0')}`;
+
+  const dayNames = ['일', '월', '화', '수', '목', '금', '토'];
 
   for (let i = 0; i < days; i++) {
     const d = new Date(kstNow);
@@ -29,22 +44,24 @@ function getTargetDates(days = 14) {
     const yyyy = d.getUTCFullYear();
     const mm = String(d.getUTCMonth() + 1).padStart(2, '0');
     const dd = String(d.getUTCDate()).padStart(2, '0');
+    const dateStr = `${yyyy}${mm}${dd}`;
     const dayOfWeek = d.getUTCDay(); // 0: 일, 6: 토
 
-    const isWeekend = dayOfWeek === 0 || dayOfWeek === 6;
-    const dayNames = ['일', '월', '화', '수', '목', '금', '토'];
+    const isWeekendOrHoliday = dayOfWeek === 0 || dayOfWeek === 6 || KR_HOLIDAYS.has(dateStr);
 
     dates.push({
-      dateStr: `${yyyy}${mm}${dd}`,
+      dateStr,
       dateFormatted: `${yyyy}-${mm}-${dd}(${dayNames[dayOfWeek]})`,
-      isWeekend,
-      targetTimes: isWeekend ? WEEKEND_TIMES : WEEKDAY_TIMES
+      dayType: isWeekendOrHoliday ? (KR_HOLIDAYS.has(dateStr) ? '공휴일' : '주말') : '평일',
+      targetTimes: isWeekendOrHoliday ? WEEKEND_TIMES : WEEKDAY_TIMES,
+      isToday: dateStr === currentYmd,
+      currentHm
     });
   }
   return dates;
 }
 
-// 텔레그램 메시지 발송
+// 텔레그램 메시지 발송 함수
 async function sendTelegram(text) {
   const token = process.env.TELEGRAM_BOT_TOKEN;
   const chatId = process.env.TELEGRAM_CHAT_ID;
@@ -56,155 +73,158 @@ async function sendTelegram(text) {
     headers: { 'Content-Type': 'application/json' },
     body: JSON.stringify({
       chat_id: chatId,
-      text: text,
+      text,
       parse_mode: 'HTML',
       disable_web_page_preview: true
     })
   });
 }
 
-// 단일 (날짜 + 코트) 예약 현황 조회
-async function checkCourtDate(placeId, courtName, dateInfo) {
-  const { dateStr, dateFormatted, targetTimes } = dateInfo;
+// 단일 (날짜 + 코트) JSON API 호출
+async function fetchCourtState(placeCode, courtName, dateInfo) {
+  const { dateStr, targetTimes, isToday, currentHm } = dateInfo;
 
-  // 사용자 직접 접속용 예약 링크
-  const bookingUrl = `https://sports.gangseo.seoul.kr/fmcs/28?facilities_type=C&base_date=${dateStr}&rent_type=1001&center=GANGSEO03&part=02&place=${placeId}#regist_list`;
+  const apiUrl =
+    `https://sports.gangseo.seoul.kr/rest/facilities/place_time_state_list` +
+    `?company_code=GANGSEO03&part_code=02&place_code=${placeCode}` +
+    `&base_date=${dateStr}&rent_type=1001&mem_no=&_=${Date.now()}`;
 
-  // [핵심] FMCS 내부 시간표 조회 엔드포인트
-  // 기본 URL은 FMCS 표준 AJAX 엔드포인트이며, 환경변수(FMCS_AJAX_URL)로 커스텀 가능
-  const ajaxEndpoint =
-    process.env.FMCS_AJAX_URL ||
-    `https://sports.gangseo.seoul.kr/fmcs/28`;
-
-  const queryParams = new URLSearchParams({
-    facilities_type: 'C',
-    base_date: dateStr,
-    rent_type: '1001',
-    center: 'GANGSEO03',
-    part: '02',
-    place: String(placeId),
-    action: 'regist_list' // FMCS 시간표 모듈 액션 파라미터
-  });
+  const bookingUrl =
+    `https://sports.gangseo.seoul.kr/fmcs/28` +
+    `?facilities_type=C&base_date=${dateStr}` +
+    `&rent_type=1001&center=GANGSEO03&part=02&place=${placeCode}#regist_list`;
 
   try {
-    const response = await fetch(`${ajaxEndpoint}?${queryParams.toString()}`, {
+    const res = await fetch(apiUrl, {
       method: 'GET',
       headers: {
+        'Accept': 'application/json, text/javascript, */*; q=0.01',
         'User-Agent': 'Mozilla/5.0 (Windows NT 10.0; Win64; x64) Chrome/130.0.0.0 Safari/537.36',
         'X-Requested-With': 'XMLHttpRequest',
         'Referer': bookingUrl
       }
     });
 
-    const contentType = response.headers.get('content-type') || '';
-    const bodyText = await response.text();
-    const foundSlots = [];
+    if (!res.ok) return { placeCode, courtName, dateInfo, bookingUrl, openSlots: [] };
 
-    // 1) 응답이 JSON 형태인 경우 (FMCS API 버전별 대응)
-    if (contentType.includes('application/json') || bodyText.trim().startsWith('{') || bodyText.trim().startsWith('[')) {
-      const data = JSON.parse(bodyText);
-      const list = Array.isArray(data) ? data : (data.list || data.data || data.result || []);
+    const list = await res.json();
+    if (!Array.isArray(list)) return { placeCode, courtName, dateInfo, bookingUrl, openSlots: [] };
 
-      for (const item of list) {
-        const timeStr = item.start_time || item.time_name || item.rent_time || JSON.stringify(item);
-        const stateStr = item.state_nm || item.status || item.rent_yn || JSON.stringify(item);
+    const openSlots = [];
 
-        for (const tTime of targetTimes) {
-          if (timeStr.includes(tTime)) {
-            const isAvailable =
-              (stateStr.includes('가능') || stateStr.includes('신청') || item.rent_yn === 'Y' || item.available === true) &&
-              !stateStr.includes('마감') &&
-              !stateStr.includes('불가') &&
-              !stateStr.includes('완료');
+    for (const item of list) {
+      const startTime = (item.start_time || '').trim();
+      const endTime = (item.end_time || '').trim();
+      const timeNm = (item.time_nm || '').trim();
+      const useYn = String(item.use_yn || '').trim().toUpperCase();
+      const detail = String(item.detail || '').trim();
 
-            if (isAvailable) {
-              foundSlots.push(tTime);
-            }
-          }
-        }
+      // 1) 우리가 원하는 타겟 시간대인지 확인 (평일: 19:00, 주말: 전 시간대)
+      if (!targetTimes.includes(startTime)) continue;
+
+      // 2) 오늘 날짜인 경우 이미 시작 시간이 지난 타임은 제외
+      if (isToday && startTime <= currentHm) continue;
+
+      // 3) 빈자리 판별 핵심 로직:
+      // 예약이 차 있으면 detail에 "홍길동(홍길동)"처럼 이름이 들어가고 use_yn이 "Y"가 됨.
+      // 빈자리는 detail이 비어있거나("") use_yn이 "N"으로 내려옴.
+      const isAvailable = (detail === '' || useYn === 'N');
+
+      if (isAvailable) {
+        openSlots.push({
+          startTime,
+          endTime,
+          timeNm
+        });
       }
     }
-    // 2) 응답이 HTML 테이블 조각인 경우
-    else {
-      const $ = cheerio.load(bodyText);
-      $('tr').each((_, el) => {
-        const rowText = $(el).text().replace(/\s+/g, ' ').trim();
-        if (!rowText) return;
 
-        for (const tTime of targetTimes) {
-          if (rowText.includes(tTime)) {
-            const isAvailable =
-              (rowText.includes('예약가능') || rowText.includes('신청') || rowText.includes('가능') || $(el).find('input[type="checkbox"]:not(:disabled)').length > 0) &&
-              !rowText.includes('마감') &&
-              !rowText.includes('완료') &&
-              !rowText.includes('불가');
-
-            if (isAvailable) {
-              foundSlots.push(tTime);
-            }
-          }
-        }
-      });
-    }
-
-    return { placeId, courtName, dateInfo, bookingUrl, foundSlots };
+    return { placeCode, courtName, dateInfo, bookingUrl, openSlots };
   } catch (err) {
-    console.error(`[Error] ${dateStr} - ${courtName}:`, err.message);
-    return { placeId, courtName, dateInfo, bookingUrl, foundSlots: [] };
+    console.error(`[ 조회 오류 ] ${dateStr} ${courtName}:`, err.message);
+    return { placeCode, courtName, dateInfo, bookingUrl, openSlots: [] };
   }
 }
 
 export default async function handler(req, res) {
-  // 1. 보안용 CRON_SECRET 검증 (아무나 URL을 호출하지 못하도록 방지)
+  // 1. 보안용 Secret 검증
   const secret = req.query.secret || req.headers['x-cron-secret'];
   if (process.env.CRON_SECRET && secret !== process.env.CRON_SECRET) {
     return res.status(401).json({ error: 'Unauthorized' });
   }
 
-  // 조회할 일수 (쿼리 파라미터 ?days=7 로 조절 가능, 기본 10일)
-  const daysToScan = parseInt(req.query.days || '10', 10);
+  // 기본 25일 치 조회 (쿼리 파라미터 ?days=14 등으로 조절 가능)
+  const daysToScan = parseInt(req.query.days || '25', 10);
   const targetDates = getTargetDates(daysToScan);
 
-  // 2. 모든 (날짜 x 4개 코트) 조합 생성 및 병렬 조회
+  // 2. 전체 (날짜 x 4개 코트) 작업 목록 생성
   const tasks = [];
   for (const dateInfo of targetDates) {
-    for (const [placeId, courtName] of Object.entries(COURTS)) {
-      tasks.push(checkCourtDate(placeId, courtName, dateInfo));
+    for (const [placeCode, courtName] of Object.entries(COURTS)) {
+      tasks.push(() => fetchCourtState(placeCode, courtName, dateInfo));
     }
   }
 
-  const results = await Promise.all(tasks);
+  // 강서구 서버 부하 방지를 위해 20개씩 배치(Batch) 병렬 실행 (총 1~2초 소요)
+  const BATCH_SIZE = 20;
+  const results = [];
+  for (let i = 0; i < tasks.length; i += BATCH_SIZE) {
+    const chunk = tasks.slice(i, i + BATCH_SIZE).map((fn) => fn());
+    const chunkRes = await Promise.all(chunk);
+    results.push(...chunkRes);
+  }
+
   const newlyFound = [];
+  const allCurrentlyOpen = [];
 
   for (const item of results) {
-    const { placeId, courtName, dateInfo, bookingUrl, foundSlots } = item;
+    const { placeCode, courtName, dateInfo, bookingUrl, openSlots } = item;
+    const openStartTimes = new Set(openSlots.map((s) => s.startTime));
 
     for (const tTime of dateInfo.targetTimes) {
-      const slotKey = `${dateInfo.dateStr}_${placeId}_${tTime}`;
+      const slotKey = `${dateInfo.dateStr}_${placeCode}_${tTime}`;
 
-      if (foundSlots.includes(tTime)) {
-        // 이전에 알림을 보낸 적 없는 슬롯만 발송 목록에 추가
+      if (openStartTimes.has(tTime)) {
+        const slotDetail = openSlots.find((s) => s.startTime === tTime);
+        const slotInfo = {
+          dateFormatted: dateInfo.dateFormatted,
+          dayType: dateInfo.dayType,
+          courtName,
+          timeRange: `${slotDetail.startTime}~${slotDetail.endTime} (${slotDetail.timeNm})`,
+          bookingUrl
+        };
+        allCurrentlyOpen.push(slotInfo);
+
+        // 이전에 알림을 보낸 적이 없는 새로운 빈자리만 발송 목록에 추가
         if (!notifiedCache.has(slotKey)) {
           notifiedCache.add(slotKey);
-          newlyFound.push({
-            dateFormatted: dateInfo.dateFormatted,
-            courtName,
-            time: `${tTime} ~ ${parseInt(tTime.split(':')[0], 10) + 2}:00`,
-            bookingUrl
-          });
+          newlyFound.push(slotInfo);
         }
       } else {
-        // 다시 마감되었으면 캐시에서 삭제 (다음에 취소표가 다시 나오면 재알림)
+        // 누군가 예약해서 마감되면 캐시에서 제거 (나중에 다시 취소표가 나오면 재알림)
         notifiedCache.delete(slotKey);
       }
     }
   }
 
-  // 3. 새로운 빈자리가 있으면 텔레그램 메시지 1개로 묶어서 전송
+  // 3. 테스트 발송 옵션 (?test=1 붙여서 호출 시 강제로 작동 확인 메시지 전송)
+  if (req.query.test === '1') {
+    await sendTelegram(
+      `✅ <b>[강서구립테니스장 알림 봇 정상 작동 중]</b>\n` +
+      `• 스캔 기간: 향후 ${daysToScan}일 (${tasks.length}개 코트·날짜 조합)\n` +
+      `• 현재 열려있는 타겟 빈자리: ${allCurrentlyOpen.length}건`
+    );
+  }
+
+  // 4. 새로운 빈자리 발견 시 텔레그램 알림 발송
   if (newlyFound.length > 0) {
     const lines = newlyFound.map(
-      (s) => `• <b>${s.dateFormatted}</b> | <b>${s.courtName}</b> | ${s.time}\n  👉 <a href="${s.bookingUrl}">바로 예약하기</a>`
+      (s) =>
+        `• <b>${s.dateFormatted} [${s.dayType}]</b>\n` +
+        `  🏟 <b>${s.courtName}</b> | ⏰ ${s.timeRange}\n` +
+        `  👉 <a href="${s.bookingUrl}">예약 페이지 바로가기</a>`
     );
+
     const message =
       `🎾 <b>[강서구립테니스장 빈자리 발생!]</b>\n\n` +
       lines.join('\n\n');
@@ -214,9 +234,10 @@ export default async function handler(req, res) {
 
   return res.status(200).json({
     ok: true,
-    scannedDates: daysToScan,
-    totalChecks: tasks.length,
+    scannedDays: daysToScan,
+    totalApiCalls: tasks.length,
+    currentlyOpenCount: allCurrentlyOpen.length,
     newAlertsSent: newlyFound.length,
-    newSlots: newlyFound
+    currentlyOpen: allCurrentlyOpen
   });
 }
